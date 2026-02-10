@@ -2,16 +2,17 @@
 #include <Adafruit_TCS34725.h>
 
 /* * Speed/Accuracy Setup:
- * Integration Time: 24ms (0xF6) - fast enough for moving objects[cite: 613].
- * Gain: 16X - better for distinguishing blue/green shades[cite: 143, 677].
+ * Integration Time: 24ms (0xF6) - fast enough for moving objects.
+ * Gain: 16X - better for distinguishing blue/green shades.
  */
-Adafruit_TCS34725 tcs = Adafruit_TCS34725(TCS34725_INTEGRATIONTIME_25MS, TCS34725_GAIN_16X);
+Adafruit_TCS34725 tcs = Adafruit_TCS34725(TCS34725_INTEGRATIONTIME_24MS, TCS34725_GAIN_16X);
 
 // ---------- TUNING KNOBS ----------
-const uint16_t PRESENT_CLEAR = 1800; // Presence gate: Only process if item is close[cite: 355].
+const uint16_t PRESENT_CLEAR = 600;   // Lowered from 1800 to detect objects further away.
+const uint16_t MAX_SAFE_CLEAR = 20000; // If C is higher than this, the sensor is likely oversaturated.
 const float SAT_RECYCLE_MIN  = 0.15f; // Minimum "colorfulness" to be considered recycling.
-
-// Hue ranges for recycling [cite: 943, 944]
+const float VALUE_BLACK_MAX  = 0.2f;  // If brightness (Value) is below this, it's "Black/Dark".
+// Hue ranges for recycling
 const float GREEN_H_MIN = 80.0f;
 const float GREEN_H_MAX = 170.0f;
 const float BLUE_H_MIN  = 180.0f;
@@ -21,57 +22,74 @@ const float BLUE_H_MAX  = 260.0f;
 const int SAMPLES = 2; 
 
 void setup() {
-  Serial.begin(9600);
-  if (!tcs.begin()) {
-    Serial.println("Sensor not found!");
-    while (1);
+  // 1. INCREASE BAUD RATE: 9600 is often the bottleneck that causes slowdowns.
+  Serial.begin(115200); 
+  
+  // Tell the ESP32 to use specific pins for I2C
+  // Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.begin(21, 22);
+
+  // Explicitly telling the code to look for the sensor at address 0x29
+  if (!tcs.begin(0x29)) { 
+    Serial.println("Sensor not found at 0x29!");
+   while (1);
   }
 
-  /* * HARDWARE PERSISTENCE FILTER (Register 0x0C)
-   * We set this to 0x03. This means 3 consecutive integration cycles 
-   * must agree before an interrupt/status change is "real".
-   * This drastically improves accuracy without needing slow software delays.
-   */
+  // HARDWARE PERSISTENCE FILTER: 3 cycles must agree.
   tcs.write8(0x0C, 0x03); 
-
-  tcs.setInterrupt(false); // Turn on onboard LED [cite: 957]
+  tcs.setInterrupt(false);
 }
 
 void loop() {
   uint16_t r, g, b, c;
+  
+  // SCAN: Grab current data 
   readFastHardwareRaw(r, g, b, c);
 
-  // If nothing is in front of the sensor, do nothing [cite: 961]
+  // GATE: Ignore if nothing is there 
   if (c < PRESENT_CLEAR) {
-    return;
+    return; 
+  }
+  // Add a check to catch "Too Close" errors
+  if (c > MAX_SAFE_CLEAR) {
+    Serial.println(">>> ERROR: OBJECT TOO CLOSE (OVERSATURATED)");
+    return; 
   }
 
-  // Normalize RGB by Clear channel to handle varying distances [cite: 962]
-  float rn = (float)r / (float)c;
-  float gn = (float)g / (float)c;
-  float bn = (float)b / (float)c;
-
+  // NORMALIZE & CONVERT: Turn raw data into Hue/Sat 
   float h, s, v;
-  rgbToHsv(rn, gn, bn, h, s, v);
+  rgbToHsv((float)r/c, (float)g/c, (float)b/c, h, s, v);
 
-  // ---------- CLASSIFICATION (GARBAGE BY DEFAULT) ----------
-  // Start with the assumption that it is garbage.
+  // DECIDE: Categorize the object. Default to GARBBAGE
   String binType = "GARBAGE"; 
 
-  // Check if it qualifies as "Colorful" enough to be a recycling block
-  if (s >= SAT_RECYCLE_MIN) {
-    // Check if the color falls into Green or Blue recycling ranges
+  // EXCEPTION FOR BLACK/DARKNESS
+  // If the light reflected is too dim, we don't even check color.
+  if (v < VALUE_BLACK_MAX) {
+    binType = "GARBAGE"; 
+  } 
+  else if (s >= SAT_RECYCLE_MIN) {
     if ((h >= GREEN_H_MIN && h <= GREEN_H_MAX) || 
         (h >= BLUE_H_MIN && h <= BLUE_H_MAX)) {
       binType = "RECYCLING";
     }
   }
 
-  // Output results
-  Serial.print(binType);
-  Serial.print(" | H: "); Serial.print(h, 1);
-  Serial.print(" S: "); Serial.print(s, 2);
-  Serial.print(" C: "); Serial.println(c);
+  // --- LEAVE SPACE FOR ACTUATOR CODE ---
+  // place "Kick" logic later.
+  if (binType == "RECYCLING") {
+    // TODO: Trigger Recycling Actuator
+    Serial.print(">>> ACTION: RECYCLING BIN | ");
+  } else {
+    // TODO: Trigger Garbage Actuator
+    Serial.print(">>> ACTION: GARBAGE BIN   | ");
+  }
+  // ----------------------
+
+  // CLEAR: Print info and end loop. 
+  // All local variables (h, s, v, binType) are deleted here.
+  Serial.print("H: "); Serial.print(h, 1);
+  Serial.print(" S: "); Serial.println(s, 2);
 }
 
 /**
